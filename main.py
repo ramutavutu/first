@@ -1,190 +1,319 @@
-import functions_framework
-import pandas as pd
-import requests
-import io
-import csv
-from datetime import datetime, date, timedelta
+# =================================================================================================
+# Importing packages
+# ==============================================================================================
+from datetime import datetime, timedelta
 import os
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.base import MIMEBase
-from email.mime.text import MIMEText
-from email.utils import formatdate
-from email import encoders
+from io import BytesIO, StringIO
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.utils.task_group import TaskGroup
+from airflow.providers.google.cloud.transfers.gcs_to_bigquery import GCSToBigQueryOperator
+from airflow.providers.google.cloud.transfers.bigquery_to_gcs import BigQueryToGCSOperator
+from airflow.providers.google.cloud.operators.bigquery import BigQueryInsertJobOperator
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from airflow.providers.google.cloud.hooks.gcs import GCSHook
+from airflow.contrib.operators.gcs_delete_operator import GoogleCloudStorageDeleteOperator
 from google.cloud import storage
-from google.cloud import secretmanager
+from airflow.operators.empty import EmptyOperator
+import requests
+import csv
+import pandas as pd
+from mapping import company_name, segment_name
+from config import API_CONFIG, QUERY_PARAMS
+import configparser
+import logging
 
 
+# =================================================================================================
+# Client for interacting with the Google Cloud Storage API
+# =================================================================================================
+
+storage_client = storage.Client()
+
+# =================================================================================================
+# Defining arguments for dag 
+# =================================================================================================
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'start_date': datetime(2023, 1, 1),
+    'retries': 3,
+    'retry_delay': timedelta(minutes=1),
+}
+# =================================================================================================
 
 
-def get_devicetype_data(start_date, var, var_name):
-    
-    url = f"https://bridge2solutions.matomo.cloud/index.php?module=API&format=CSV&idSite=" + str(var) + "&period=day&date=" + str(start_date) + "&method=DevicesDetection.getType&expanded=1&translateColumnNames=1&language=en&token_auth=c5414fd9e0063326ceefd7f832f93848&filter_limit=-1&translateColumnNames=1"
-    print(url)    
-    # getting response from the url
-    # response = requests.get(url)
+# =================================================================================================
+# Reading variables.properties and performing declaration of the variables
+# =================================================================================================
+env="DEV"
 
-    # response.headers
-    # contentType = response.headers['content-type']
-    # contentType
-    # print(response.encoding)
-    
-    response = requests.get(url)  
-    if response.status_code == 200:
-        df = pd.read_csv(io.StringIO(response.text))
-        # print(df.head())
-    else:
-        print('failed to fetch data from the API')
+config = configparser.ConfigParser()
+sample_config = """
+[DEV]
+Staging_Dataset = bkt_matomo_staging
+Final_Dataset = bkt_matomo_curated
+Transformation_Dataset = bkt_matomo_transformed
+Project_Name = bkt-nonprod-dev-dwh-svc-00
+Source_Landing_Bucket = bkt-matomo-staging
+Destination_Landing_Bucket = bkt-matomo-destination
+"""
+# config.read("/home/airflow/gcs/data/variables.properties")
+config.read_string(sample_config)
 
-    # fetching required columns and adding the date we querying as a column
-    df = df[['Label','Unique visitors', 'Visits','Actions','Users']]
-    df['var_name'] = var_name
-    df['Web_Activity_Date'] = start_date
-    df = df.fillna(0)
-    
-    # data types handling
-    df['Unique visitors'] = df['Unique visitors'].astype(int)
-    df['Actions'] = df['Actions'].astype(int)
-    df['Users'] = df['Users'].astype(int)
-    
-    return df
+Source_Landing_Bucket = config[env]['Source_Landing_Bucket']
+Destination_Landing_Bucket = config[env]['Destination_Landing_Bucket']
+Project_Name = config[env]['Project_Name']
+Staging_Dataset = config[env]['Staging_Dataset']
+Final_Dataset = config[env]['Final_Dataset']
+Transformation_Dataset = config[env]['Transformation_Dataset']
+# =================================================================================================
 
-def send_email( project_id, gcs_bucket_name, export_file, filename_chase, sendfrom, send_to, send_cc):
-    bucket_name = gcs_bucket_name #"bkt-external-files-staging"
-    blob_name = filename_chase # Name of the file to be attached
-    storage_client = storage.Client()
-    bucket = storage_client.bucket(bucket_name)
-    blob = bucket.blob(blob_name)   
 
-    username = sendfrom   # "no-reply-dba-alerts@bakkt.com"
-    client = secretmanager.SecretManagerServiceClient()
-    password = client.access_secret_version(request={"name": "projects/"+ project_id +"/secrets/no-reply-dba-alerts/versions/latest"}).payload.data.decode("UTF-8")
-    print(password)
-    # password = "VNB4jr$Il1=g"
-    fileName = filename_chase #Name of the file to show as attachment name
-    # sendfrom = "no-reply-dba-alerts@bakkt.com"
-    # send_to = "ramu.tavutu@bakkt.com"
-    server = "smtp.office365.com"
-    port = 587
-    subject = "Matomo Device Type Report for Chase"
-    text = """ 
-    Hello All ,
-                
-        Please find the Report attached. 
-                
-    Best Regards,
-    Data Analytics
-            """ 
-                
-    msg = MIMEMultipart()
-    msg['From'] = sendfrom
-    # msg['To'] =  send_to
-    msg['To'] = '; '.join(send_to)
-    msg['Cc'] = '; '.join(send_cc)
-    msg['Date'] = formatdate(localtime = True)
-    msg['Subject'] = subject
-    msg.attach(MIMEText(text))
-    part = MIMEBase('application', "octet-stream")
-    part.set_payload(blob.open("r").read())
-    encoders.encode_base64(part)
-    part.add_header('Content-Disposition', 'attachment; filename='+ fileName)
-    msg.attach(part)
-    smtp = smtplib.SMTP(server, port)
+# =====================================================================================================
+# Calling matomo rest api and loading all the files to bakkt gcs bucket
+# =========================================================================================================
+def call_api_to_gcs(**kwargs):
+    client = storage.Client()
+    bucket_name = Source_Landing_Bucket
+    bucket = client.bucket(bucket_name)
 
-    smtp.ehlo()
-    smtp.starttls()
-    smtp.login(username,password)
-    smtp.sendmail(msg['From'], [msg['To']], msg.as_string())
-    # smtp.sendmail(msg['From'], [msg['To']], msg)
-    smtp.quit()
-    return 'Success'
+    base_url = API_CONFIG['base_url']
+    endpoint = API_CONFIG['endpoint']
 
-# -----------------------------------------------Main Program start--------------------------------------------------------
-# Please specify the below start_date and end_date
-@functions_framework.http
-def hello_http(request):
-    
-    time_range = {
-        "start_date": date.today() - timedelta(days=2), #'2023-12-08',
-        "end_date" : date.today() - timedelta(days=1) #'2023-12-09'
+    # filename = (datetime.now() - timedelta(days=30)).strftime("%B_%Y")
+    filename = "January_2023"
+
+    for params in QUERY_PARAMS:
+        print(params)
+
+        SITEID = params['idSite']
+        if SITEID in company_name:
+            Id = company_name[SITEID]
+        else:
+            print(f"No matching Site ID found for {SITEID}")
+            continue
+
+        seg = ""
+        SEGMENT= params['segment']
+        if SEGMENT in segment_name:
+            seg = segment_name[SEGMENT]
+        else:
+            print(f"No matching Segment ID found for {SEGMENT}")
+            continue
+
+        url = f"{base_url}/{endpoint}"
+        response = requests.get(url, params=params)
+
+        data = response.text.strip().splitlines()
+
+        blob_name = f"{Id}_{seg}_{filename}.csv"
+        blob = bucket.blob(blob_name)
+
+        with open(blob_name, "w", newline="") as csv_file:
+            csv_writer = csv.writer(csv_file)
+            csv_reader = csv.reader(data)
+            for row in csv_reader:
+                csv_writer.writerow(row)
+
+        blob.upload_from_filename(blob_name)
+
+        print(f"Data saved to {blob_name} in GCS bucket {bucket_name}")
+
+
+# =================================================================================================
+# Defining all the tasks we want to include in the dag 
+# =================================================================================================
+
+with DAG(
+    'bkt_matomo_pipeline', 
+    default_args=default_args, 
+    schedule_interval='@monthly',
+    catchup=False,
+    params={
+        "Project_Name": Project_Name,
+        "Staging_Dataset" : Staging_Dataset,
+        "Final_Dataset" : Final_Dataset,
+        "Transformation_Dataset" : Transformation_Dataset,
     }
+) as dag:
 
-    project_id = "bkt-nonprod-dev-dwh-svc-00"
-    gcs_bucket_name = 'bkt-external-files-staging'
+    # Start dummy task 
+    start = EmptyOperator(
+        task_id='Start_DAG'
+    )
 
-    filename_chase = "Device_Type_chase" + "_" + datetime.now().strftime("%Y-%m-%d") + ".csv"
-    filename = "Device_Type"
 
-    sendfrom = "no-reply-dba-alerts@bakkt.com"
-    send_to = ["ramu.tavutu@bakkt.com", "no-reply-dba-alerts@bakkt.com"]
-    send_cc = ["ramu.tavutu@bakkt.com", "no-reply-dba-alerts@bakkt.com"]
+    # End dummy task
+    end = EmptyOperator(
+        task_id='End_DAG'
+    )
 
-    df_final = pd.DataFrame() 
+    # Task to fetch data from matomo's rest api and load data into GCS bucket.
+    api_to_gcs_operator = PythonOperator(
+    task_id='call_api_to_gcs',
+    python_callable=call_api_to_gcs,
+    provide_context=True,
+    dag=dag
+    )
 
-    #Mapping of client's SITE ID to client name
-    company_name = {
-        1:"b2s",
-        2:"Delta",
-        3:"WF",
-        4:"rbc",
-        5:"fsv",
-        6:"psg",
-        7:"FDR",
-        8:"FDR_PSCU",
-        9:"pnc",
-        14:"BSWIFT",
-        15:"Chase",
-        16:"CITIFINTECH",
-        18:"GRASSROOTSUK",
-        20:"scotia",
-        21:"ua",
-        22:"VITALITYCA",
-        24:"VITALITYUS",
-        25:"CARD",
-        26:"TAZ",
-        27:"PAC",
-        28:"CHIP",
-        29:"PGA",
-        34:"VIRGINUA",
-        35:"bac"
+    #Fetching the required data from staging files to BQ transformation dataset.
+    filtering_data = BigQueryInsertJobOperator(
+    task_id="filtering_data_from_raw_files",
+    configuration={
+        "query": {
+            "query": "{% include 'sql/filtering_data.sql' %}",
+            "useLegacySql": False,
+        }
     }
+    )
 
-    # loop through the given dates and list of Vars
-    daterange = pd.date_range(start = time_range['start_date'], end = time_range['end_date'])
-    for var in company_name:
-        print(var , "--->", company_name[var]) 
-        var_name = company_name[var]
-        try:
-            for i in daterange:
-                print(i.date())
-                df = get_devicetype_data(i.date(), var, var_name) #Function call to fetch data from API
-                # df_final = df_final.append(df, ignore_index= True )
-                df_final = pd.concat([df_final,df])
+    # Task for exporting GCS files to BQ Staging Dataset
+    with TaskGroup("export_gcs_to_bq", tooltip="Export Matomo data from GCS to BQ") as export_gcs_to_bq:
+        # filename = (datetime.now() - timedelta(days=30)).strftime("%B_%Y")
+        filename = "January_2023"
+        for params in QUERY_PARAMS:
+            client_name = company_name[params['idSite']] 
+            seg_name = segment_name[params['segment']]
+            file_path = client_name + "_" + seg_name + "_" + filename + ".csv"
+            table_name = client_name + "_" + seg_name
+
+            task_id = 'gcs_to_bq_{}'.format(table_name)
+            gcs_to_bq = GCSToBigQueryOperator(
+                task_id=task_id,
+                bucket=Source_Landing_Bucket,
+                source_objects=file_path,
+                destination_project_dataset_table=Project_Name + "." + Staging_Dataset + "." + table_name,
+                source_format='CSV',
+                create_disposition='CREATE_IF_NEEDED',
+                write_disposition='WRITE_TRUNCATE',
+                skip_leading_rows=1,
+                field_delimiter=',',
+                autodetect=True,
+            )
+    start >> api_to_gcs_operator >> export_gcs_to_bq >> filtering_data
         
-        except:
-            pass
-        
-    print(df_final)
-    # below two lines can be commented
-    df_final.query("var_name == 'Chase'").to_csv('Device_Type_chase.csv', index=False)
-    df_final.to_csv('Device_Type.csv', index=False)
 
-    # writting to GCS bucket
-    export_file = "gs://" + gcs_bucket_name + "/" + filename_chase 
-    print(f"export file name {export_file}")
-    df_final.query("var_name == 'Chase'").to_csv(export_file, index=False) #exporting only Chase Device types
-    print('Output file written to GCS')
+    #Updating and doing some transformations from BQ staging dataset to BQ transformation dataset.
+    update_tables = BigQueryInsertJobOperator(
+    task_id="updating_data_from_staging_dataset",
+    configuration={
+        "query": {
+            "query": "{% include 'sql/update_data.sql' %}",
+            "useLegacySql": False,
+        }
+    }
+    )
+
+    #Transferring data to final dataset's tables
+    data_curation = BigQueryInsertJobOperator(
+    task_id="data_curation",
+    configuration={
+        "query": {
+            "query": "{% include 'sql/data_curation.sql' %}",
+            "useLegacySql": False,
+        }
+    }
+    )
+
+    #Truncating all the staging files
+    Truncate_tables = BigQueryInsertJobOperator(
+    task_id="Truncate_tables",
+    configuration={
+        "query": {
+            "query": "{% include 'sql/truncate_tables.sql' %}",
+            "useLegacySql": False,
+        }
+    }
+    )
+
+    #dump task
+    dummy_task = EmptyOperator(
+    task_id='Dummy'
+    )
+
+    # Define the BigQuery dataset and GCS bucket information
+    bq_dataset_id = Final_Dataset
+    gcs_bucket = Source_Landing_Bucket
+    csv_prefix = 'csv'
+    xlsx_prefix = 'excel'
+    xlsx_bucket = Destination_Landing_Bucket
+    bq_hook = BigQueryHook()
+    # Loop through all tables in the BigQuery dataset and copy them to GCS
+    with TaskGroup("csv_conversion", tooltip="CSV conversion") as csv_conversion:
+        for table in bq_hook.get_dataset_tables(dataset_id=bq_dataset_id):
+            try:
+                # Define the BigQuery table information
+                bq_table_id = table['tableId']
+                gcs_csv_object = f'{csv_prefix}/{bq_table_id}.csv'
+                gcs_xlsx_object = f'{xlsx_prefix}/{bq_table_id}.xlsx'
+                xlsx_filename = str(bq_table_id) + '.xlsx'
+                # Define the BigQueryToGCSOperator to copy the table to GCS
+                export_task_id = f'export_{bq_table_id}_to_gcs'
+                export_task = BigQueryToGCSOperator(
+                    task_id=export_task_id,
+                    source_project_dataset_table=f'{bq_dataset_id}.{bq_table_id}',
+                    destination_cloud_storage_uris=[f'gs://{gcs_bucket}/{gcs_csv_object}'],
+                    export_format='CSV',
+                    field_delimiter=','
+                )
+            except Exception as e:
+                # Log the exception and continue with the next table
+                logging.exception(f"An error occurred while executing the export task for {bq_table_id}: {e}")
+    data_curation >> csv_conversion >> dummy_task
+
+    
+    # Function to convert CSV to Excel
+    def convert_csv_to_excel(blob_name):
+
+        # Read the CSV file into a pandas DataFrame
+        df = pd.read_csv(f"gs://{gcs_bucket}/{blob_name}")
+
+        # Construct the Excel file name by replacing .csv with .xlsx
+        excel_file_name = blob_name.replace("csv/","").replace('.csv', '.xlsx')
+
+        # Convert CSV to Excel
+        excel_writer = pd.ExcelWriter(excel_file_name, engine='xlsxwriter')
+        df.to_excel(excel_writer, index=False)
+        excel_writer.save()
+        excel_writer.close()
+
+        # Upload Excel file to destination GCS bucket
+        destination_bucket = storage_client.bucket(xlsx_bucket)
+        excel_blob = destination_bucket.blob("excel/" + excel_file_name)
+        excel_blob.upload_from_filename(excel_file_name)
+
+        # Print a message to indicate success
+        print(f"Converted {blob_name} to {excel_file_name} and uploaded to {xlsx_bucket}")
+
+        # Remove temporary Excel file
+        os.remove(excel_file_name)
+
+    # Iterate over all CSV files in the source bucket
+    blobs = storage_client.get_bucket(gcs_bucket).list_blobs(prefix="csv/")
+    with TaskGroup("excel_conversion", tooltip="Excel conversion") as excel_conversion:
+        for blob in blobs:
+            try:
+                if blob.name.endswith(".csv"):
+                    # Create a PythonOperator for each CSV file
+                    convert_task = PythonOperator(
+                        task_id=f"convert_{blob.name}_to_excel".replace("/","_"),
+                        python_callable=convert_csv_to_excel,
+                        op_args=[blob.name],
+                        dag=dag
+                    )
+            except Exception as e:
+                # Log the exception and continue with the next table
+                logging.exception(f"An error occurred while executing the export task for {bq_table_id}: {e}")
+            
+    dummy_task >> excel_conversion >> end
 
 
-
-    email_send_status = send_email(project_id, gcs_bucket_name, export_file, filename_chase, sendfrom, send_to, send_cc ) #Function call to send email
-    print(f"\n Email send status:  {email_send_status}")
-    return 'Success'
-
-    # -----------------------------------------------Main Program End--------------------------------------------------------
-
-
-
-
-
-
+# =================================================================================================
+# Defining the execution order of tasks we created
+# =================================================================================================
+    # Set dependencies
+    filtering_data >> Truncate_tables >> update_tables >> data_curation
+    
+     
+# ================================================================================================
